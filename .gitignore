@@ -7,8 +7,8 @@
 .vscode/.browse.c_cpp.db*
 .vscode/ipch/
 
-# Session scratch: a resume note plus a snapshot of the then-untracked tree.
-# Superseded by real history now that commits exist.
+# Local artifacts of the user's checkpointing skill — session scratch, regenerated
+# on demand. Canonical repo state lives in STATUS.md and in git history.
 CHECKPOINT.md
 CHECKPOINT.diff
 
