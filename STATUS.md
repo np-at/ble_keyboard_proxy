@@ -20,10 +20,11 @@ long-term goal is system-wide keyboard capture on macOS.
   Close the monitor first.
 
 ```bash
-pio run                 # build
+pio run                 # build (default env only — see platformio.ini)
 pio run -t upload       # flash (UART port)
 pio run -t erase        # full chip erase — invalidates bonds, forces re-pair
 pio device monitor      # serial monitor (close before running host scripts)
+pio test -e native      # native unit tests for pure logic — no board needed
 
 ~/.platformio/penv/bin/python host/test_proxy_term.py             # host tests
 ~/.platformio/penv/bin/python host/proxy_term.py --target iphone  # interactive
@@ -41,6 +42,7 @@ A healthy build is roughly `RAM 9.1% / Flash 7.6%`. A much larger flash figure
 | `src/hid_report.h` | `HidReport`/`ConsumerReport`/`Command` — the transport-agnostic seam. |
 | `src/serial_proto.h/.cpp` | Non-blocking hex line parser. No BLE knowledge. |
 | `src/ble_hid_sink.h/.cpp` | Wraps `BleKeyboard`. No serial knowledge. |
+| `src/slot_address.h` | Derives a per-bond-slot BLE identity address from the chip's base MAC. Header-only, no Arduino/BLE includes — natively testable. |
 | `host/proxy_term.py` | Terminal → BLE proxy. Raw-mode TTY loop, `--text`, `--probe`. |
 | `host/test_proxy_term.py` | Tests for the pure host layer. No hardware needed. |
 
@@ -139,6 +141,8 @@ the active target on demand. Today a single bond is supported and changing devic
 means re-pairing, which defeats the point of the thing. Firmware work: NimBLE bond-
 slot management plus a serial verb to select the peer, then a host command to drive
 it. Switching device should probably switch the `TARGETS` keymap with it.
+Address derivation (`src/slot_address.h`, `[env:native]` unit tests) is done; bond-
+slot management and the serial verb are not started.
 
 **Then — M2: macOS system-wide capture.** A CGEventTap daemon replacing the terminal
 as the producer, so keystrokes are proxied from anywhere rather than only from a
