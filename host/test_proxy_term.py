@@ -87,8 +87,46 @@ def test_targets_complete():
         for name, _label in pt.COMMANDS.values():
             assert name in table, f"{target} missing command {name}"
             kind, a, b = table[name]
-            assert kind in ("K", "C"), f"{target}/{name} bad kind {kind!r}"
-            assert 0 <= a <= 0xFF and 0 <= b <= 0xFF, f"{target}/{name} byte range"
+            assert kind in ("K", "C", "X"), f"{target}/{name} bad kind {kind!r}"
+            if kind == "X":
+                # An unavailable action must explain itself; the reason is shown
+                # to the user in place of sending anything.
+                assert isinstance(a, str) and a.strip(), f"{target}/{name} no reason"
+            else:
+                assert 0 <= a <= 0xFF and 0 <= b <= 0xFF, f"{target}/{name} byte range"
+
+
+@case("iPhone reports Back and app switcher as unavailable rather than sending")
+def test_iphone_unavailable():
+    # Verified on hardware: iOS ignores AC Back, and Cmd+[/Cmd+Tab are iPad-only.
+    # Sending them anyway would look like a silent failure.
+    assert pt.TARGETS["iphone"]["back"][0] == "X"
+    assert pt.TARGETS["iphone"]["apps"][0] == "X"
+    # ...but the two that were verified working must still actually send.
+    assert pt.TARGETS["iphone"]["home"] == ("C", 0x80, 0x00)
+    assert pt.TARGETS["iphone"]["spot"] == ("K", pt.MOD_LGUI, pt.KEY_SPACE)
+
+
+@case("command_help renders every target without blowing up")
+def test_command_help():
+    for target in pt.TARGETS:
+        text = pt.command_help(target)
+        assert target in text
+        for _name, label in pt.COMMANDS.values():
+            assert label in text, f"{target} help missing {label}"
+
+
+@case("--probe specs parse, and bad ones are rejected")
+def test_parse_probe():
+    assert pt.parse_probe("K:08:2B") == ("K", 0x08, 0x2B)
+    assert pt.parse_probe("c:00:20") == ("C", 0x00, 0x20)
+    for bad in ("K:08", "Z:00:00", "K:zz:00", "K:100:00", ""):
+        try:
+            pt.parse_probe(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{bad!r} should have been rejected")
 
 
 @case("leader key is not something resolve_char would also map")

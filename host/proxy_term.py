@@ -10,13 +10,16 @@ the ESP32 as a HID report. Whatever you type here appears on the BLE-paired phon
 
 Ctrl-] is a leader key for device commands, not an immediate quit:
 
-    Ctrl-] h   Home          Ctrl-] q   Quit
-    Ctrl-] b   Back          Ctrl-] ?   List commands
+    Ctrl-] h   Home                 Ctrl-] q   Quit
+    Ctrl-] b   Back                 Ctrl-] ?   List commands
     Ctrl-] a   App switcher
+    Ctrl-] s   Spotlight / search
 
 Which chord actually does these things differs per OS, so pick --target
-(android, ipad, iphone). See TARGETS below — those mappings are unverified
-guesses and are expected to need adjustment against a real device.
+(android, ipad, iphone). Some commands are genuinely unreachable on some
+targets — on iPhone there is no Back and no app switcher over BLE HID — and
+those report why instead of silently sending a chord that does nothing.
+See TARGETS below for what is verified and what is still a guess.
 
 Needs pyserial. If your system python lacks it, the PlatformIO venv has it:
 
@@ -124,39 +127,56 @@ LEADER = "\x1d"  # Ctrl-] — prefix for device commands (see COMMANDS)
 # --- Device commands -------------------------------------------------------------
 # Press LEADER then one of these keys to send a navigation command to the phone.
 #
-# An action is either ("K", mod, usage) — a keyboard chord — or ("C", b0, b1) — a
-# consumer/media bitmask. The consumer form is limited to the 16 keys baked into
-# T-vK's HID descriptor (see src/hid_report.h); b0/b1 are the KEY_MEDIA_* masks from
-# the library header, so AC Home is (0x80, 0x00) and AC Back is (0x00, 0x20).
+# An action is one of:
+#   ("K", mod, usage)  a keyboard chord
+#   ("C", b0, b1)      a consumer/media bitmask
+#   ("X", reason, "")  not reachable on this OS; `reason` is shown to the user
 #
-# !! THESE MAPPINGS ARE UNVERIFIED. !!
-# Which chord a given OS honours over BLE HID is not something that can be checked
-# from the host side — the firmware reporting SENT says nothing about what the phone
-# did. Every entry below is a best-guess starting point that must be confirmed live
-# on the device and edited when wrong. The iPhone and Android home/back entries are
-# the shakiest; iPad's Cmd chords are the most likely to work as-is.
+# The consumer form is limited to the 16 keys baked into T-vK's HID descriptor (see
+# src/hid_report.h); b0/b1 are the KEY_MEDIA_* masks from the library header, so
+# AC Home is (0x80, 0x00) and AC Back is (0x00, 0x20).
+#
+# Verification status matters here, because none of this is checkable from the host
+# side — the firmware answering SENT says nothing about what the phone did. Entries
+# are marked VERIFIED only where a human watched the device do the thing.
+#
+# iPhone, tested 2026-07-18 with Full Keyboard Access ON:
+#   AC Home works; Cmd+Space works (Spotlight, toggles); AC Back is ignored;
+#   Cmd+[ and Cmd+Tab do nothing. Cmd+Space working is what proves the GUI modifier
+#   reaches the device, so the last two are an iPhone limitation, not a bug here —
+#   both are iPad-only behaviours. Do not "fix" them by retrying other Cmd chords.
 
 KEY_H = 0x0B
 KEY_LEFTBRACKET = 0x2F
 
+# iOS has no system-wide Back and no keyboard app-switcher on iPhone.
+_NO_IPHONE_BACK = ("X", "iPhone has no system Back over BLE HID "
+                        "(AC Back is ignored; Cmd+[ is iPad-only)", "")
+_NO_IPHONE_APPS = ("X", "iPhone has no keyboard app switcher "
+                        "(Cmd+Tab is iPad-only)", "")
+
 TARGETS = {
-    # iPadOS has genuine hardware-keyboard support, so the Cmd chords are real.
+    # iPadOS has genuine hardware-keyboard support, so the Cmd chords should be
+    # real — but UNVERIFIED, no iPad has been tested yet.
     "ipad": {
-        "home": ("K", MOD_LGUI, KEY_H),               # Cmd+H
-        "back": ("K", MOD_LGUI, KEY_LEFTBRACKET),     # Cmd+[ — in-app back, not system
-        "apps": ("K", MOD_LGUI, KEY_TAB),             # Cmd+Tab
+        "home": ("K", MOD_LGUI, KEY_H),               # Cmd+H          UNVERIFIED
+        "back": ("K", MOD_LGUI, KEY_LEFTBRACKET),     # Cmd+[, in-app  UNVERIFIED
+        "apps": ("K", MOD_LGUI, KEY_TAB),             # Cmd+Tab        UNVERIFIED
+        "spot": ("K", MOD_LGUI, KEY_SPACE),           # Cmd+Space      UNVERIFIED
     },
-    # iPhone honours far fewer chords; lean on the consumer usage where one exists.
     "iphone": {
-        "home": ("C", 0x80, 0x00),                    # AC Home
-        "back": ("K", MOD_LGUI, KEY_LEFTBRACKET),     # Cmd+[ — in-app only, shaky
-        "apps": ("K", MOD_LGUI, KEY_TAB),             # Cmd+Tab — may do nothing
+        "home": ("C", 0x80, 0x00),                    # AC Home        VERIFIED
+        "back": _NO_IPHONE_BACK,                      #                VERIFIED absent
+        "apps": _NO_IPHONE_APPS,                      #                VERIFIED absent
+        "spot": ("K", MOD_LGUI, KEY_SPACE),           # Cmd+Space      VERIFIED
     },
     # Android maps AC Home / AC Back to the real system buttons.
     "android": {
-        "home": ("C", 0x80, 0x00),                    # AC Home
-        "back": ("C", 0x00, 0x20),                    # AC Back
-        "apps": ("K", MOD_LGUI, KEY_TAB),             # Meta+Tab — recents
+        "home": ("C", 0x80, 0x00),                    # AC Home        UNVERIFIED
+        "back": ("C", 0x00, 0x20),                    # AC Back        UNVERIFIED
+        "apps": ("K", MOD_LGUI, KEY_TAB),             # Meta+Tab       UNVERIFIED
+        # Meta+Space is language-switch on Android, so it is NOT the search chord.
+        "spot": ("X", "search chord not mapped for Android yet", ""),
     },
 }
 
@@ -165,6 +185,7 @@ COMMANDS = {
     "h": ("home", "Home"),
     "b": ("back", "Back"),
     "a": ("apps", "App switcher"),
+    "s": ("spot", "Spotlight / search"),
 }
 
 
@@ -187,11 +208,14 @@ def parse_probe(spec):
 
 def command_help(target):
     """One-line-per-command summary of the leader bindings for `target`."""
-    lines = ["Ctrl-] commands:"]
+    lines = [f"Ctrl-] commands ({target}):"]
     for key, (name, label) in sorted(COMMANDS.items()):
-        kind = TARGETS[target][name][0]
-        how = "chord" if kind == "K" else "consumer"
-        lines.append(f"  Ctrl-] {key}   {label} ({how})")
+        action = TARGETS[target][name]
+        if action[0] == "X":
+            note = "unavailable"
+        else:
+            note = "chord" if action[0] == "K" else "consumer"
+        lines.append(f"  Ctrl-] {key}   {label} ({note})")
     lines.append("  Ctrl-] q   Quit")
     lines.append("  Ctrl-] ?   This list")
     return "\n".join(lines)
@@ -237,14 +261,22 @@ class Link:
         self._cmd("C 00 00")
 
     def send_action(self, action):
-        """Dispatch a ("K", mod, usage) or ("C", b0, b1) device-command action."""
+        """Dispatch a device-command action. Returns True if anything was sent.
+
+        An ("X", reason, "") action sends nothing — the caller is expected to have
+        surfaced the reason. Silently sending a chord known not to work would be
+        worse than saying so.
+        """
         kind, a, b = action
         if kind == "K":
             self.tap(a, b)
         elif kind == "C":
             self.consumer(a, b)
+        elif kind == "X":
+            return False
         else:
             raise ValueError(f"unknown action kind {kind!r}")
+        return True
 
     def release_all(self):
         self._cmd("R")
@@ -402,10 +434,14 @@ def main():
                     sys.stdout.flush()
                 elif nxt in COMMANDS:
                     name, label = COMMANDS[nxt]
-                    link.send_action(commands[name])
-                    sys.stdout.write(f"[sent {label}]\r\n")
+                    action = commands[name]
+                    if action[0] == "X":
+                        sys.stdout.write(f"[{label}: {action[1]}]\r\n")
+                    else:
+                        link.send_action(action)
+                        sys.stdout.write(f"[sent {label}]\r\n")
+                        sent += 1
                     sys.stdout.flush()
-                    sent += 1
                 else:
                     sys.stdout.write("\a")  # unknown command, beep
                     sys.stdout.flush()
