@@ -55,6 +55,17 @@ Two measurements to take while it runs, because both are live risks:
   server and scan objects. It must not touch the NimBLE bond records in NVS. If
   it does, use `deinit(false)` and account for whatever it leaves behind.
 
+Two mechanics to pin down while spiking, both load-bearing:
+
+- **How to program a specific local address.** `setOwnAddrType(BLE_OWN_ADDR_RANDOM)`
+  sets the *type*, but NimBLE-Arduino wraps no "set my static address" call —
+  confirmed by grep, there is no `ble_hs_id_set_rnd` anywhere in the library.
+  The raw NimBLE host call has to be made directly against the bundled stack,
+  and the exact ordering relative to `init()` needs to be established
+  empirically. The whole architecture rests on this working.
+- **Disconnect the active peer cleanly before `deinit`,** rather than pulling
+  the stack out from under a live connection.
+
 **If the spike fails, fall back to the whitelist architecture** and record why
 in STATUS.md. Do not push on with a mechanism the hardware rejected.
 
@@ -76,9 +87,27 @@ derivation is a pure function so it can be reasoned about and logged.
 
 - **Active slot** persists in NVS (Preferences), so a reboot returns to the same
   host rather than silently landing on slot 0.
-- **Bonds** live in NimBLE's own NVS namespace. Nothing here duplicates them —
-  a second source of truth about which slots are bonded would drift. Bond
-  presence is read from `NimBLEDevice::getNumBonds()`/`getBondedAddress()`.
+- **Bonds** live in NimBLE's own NVS namespace, and the keys themselves are
+  never duplicated here.
+- **A slot → peer-identity-address map persists in NVS.** This is not a
+  redundant copy of the bond store — it is the only record of the association,
+  because NimBLE does not keep one. Verified in the vendored source:
+  `getBondedAddress(index)` wraps `ble_store_util_bonded_peers()`, which returns
+  a flat list of **peer** identity addresses in store order. Nothing in a bond
+  record names the local identity it was created against, so store order has no
+  relationship to slot number, and `getNumBonds()` is a total rather than a
+  per-slot fact.
+
+  Without this map, three things are impossible: `U <slot>` cannot pick which
+  bond to hand `deleteBond(peerAddr)`; the `bonded`/`empty` field in the `S` and
+  `P` replies cannot be computed; and the whitelist fallback architecture cannot
+  populate its whitelist. The map is written when authentication completes, from
+  the connection's `getIdAddress()`.
+
+  Note that `S <slot>` — selection itself — does *not* need it. Advertising as
+  identity *i* is enough; the host that bonded to identity *i* recognises the
+  address and reconnects with its stored LTK. This is why the spike below cannot
+  surface the gap: it exercises only selection.
 - `CONFIG_BT_NIMBLE_MAX_BONDS=4` as a build flag in `platformio.ini`, commented
   with why it is not the default 3.
 
@@ -120,9 +149,14 @@ The existing seam holds. No layer learns about another.
 requires destroying and rebuilding the keyboard object, which a by-value member
 cannot express. This is the main structural cost of the chosen architecture.
 
-If `ble_hid_sink.cpp` grows past roughly 150 lines, split the slot logic —
-address derivation and active-slot persistence — into its own small unit beside
-it. Do not let the sink become the place everything lands.
+The sink also observes authentication-complete in order to record the peer
+identity address into the slot map. That is BLE-side bookkeeping and belongs
+there, not in `main.cpp`.
+
+Given that, the slot logic — address derivation, active-slot persistence, and
+the slot → peer map — should go in its own small unit beside the sink rather
+than inside it. The sink's job is reports; it should not also become the place
+NVS lives. Address derivation stays a pure function.
 
 ## Host side
 
