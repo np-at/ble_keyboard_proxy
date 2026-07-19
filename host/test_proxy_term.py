@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Tests for the pure parts of proxy_term: key resolution and escape decoding.
+
+These need no hardware and no phone — they cover exactly the layer where a bug is
+silent, because the firmware answering SENT tells you nothing about whether the
+right usage code was chosen. Anything involving the serial link or a real terminal
+is out of scope here and has to be exercised by hand.
+
+    ~/.platformio/penv/bin/python host/test_proxy_term.py
+"""
+
+import sys
+
+import proxy_term as pt
+
+
+def feeder(s):
+    """Turn a string into a read1() callable, returning "" once exhausted."""
+    it = iter(s)
+    return lambda: next(it, "")
+
+
+CASES = []
+
+
+def case(name):
+    def deco(fn):
+        CASES.append((name, fn))
+        return fn
+    return deco
+
+
+@case("Shift+Tab (CSI Z) decodes to Shift held with Tab")
+def test_shift_tab():
+    # The reported bug: this used to fall through and send a bare Escape.
+    assert pt.read_escape(feeder("[Z")) == (pt.MOD_LSHIFT, pt.KEY_TAB)
+
+
+@case("plain Tab is unshifted, and distinct from Shift+Tab")
+def test_plain_tab():
+    assert pt.resolve_char("\t") == (pt.MOD_NONE, pt.KEY_TAB)
+    assert pt.resolve_char("\t") != pt.read_escape(feeder("[Z"))
+
+
+@case("arrow keys still decode after the tuple refactor")
+def test_arrows():
+    assert pt.read_escape(feeder("[A")) == (pt.MOD_NONE, 0x52)
+    assert pt.read_escape(feeder("[B")) == (pt.MOD_NONE, 0x51)
+    assert pt.read_escape(feeder("[C")) == (pt.MOD_NONE, 0x4F)
+    assert pt.read_escape(feeder("[D")) == (pt.MOD_NONE, 0x50)
+
+
+@case("multi-byte sequences (page up, forward delete) decode")
+def test_multibyte():
+    assert pt.read_escape(feeder("[5~")) == (pt.MOD_NONE, 0x4B)
+    assert pt.read_escape(feeder("[3~")) == (pt.MOD_NONE, 0x4C)
+
+
+@case("modified CSI form carries its modifier")
+def test_csi_modified():
+    # ESC [ 1 ; 5 C == Ctrl+Right; n-1 == 4 == ctrl bit.
+    assert pt.read_escape(feeder("[1;5C")) == (pt.MOD_LCTRL, 0x4F)
+    # n-1 == 1 == shift bit.
+    assert pt.read_escape(feeder("[1;2D")) == (pt.MOD_LSHIFT, 0x50)
+    # n-1 == 3 == shift|alt, so both bits must survive.
+    assert pt.read_escape(feeder("[1;4A")) == (pt.MOD_LSHIFT | pt.MOD_LALT, 0x52)
+
+
+@case("unknown escape returns None so the caller sends a bare Escape")
+def test_unknown_escape():
+    assert pt.read_escape(feeder("[9999x")) is None
+    assert pt.read_escape(feeder("")) is None
+
+
+@case("printable ASCII all resolves, with shift where required")
+def test_printable():
+    assert pt.resolve_char("a") == (pt.MOD_NONE, 0x04)
+    assert pt.resolve_char("A") == (pt.MOD_LSHIFT, 0x04)
+    assert pt.resolve_char("?") == (pt.MOD_LSHIFT, 0x38)
+    for ch in map(chr, range(0x20, 0x7F)):
+        assert pt.resolve_char(ch) is not None, f"unmapped printable {ch!r}"
+
+
+@case("every target defines every command, with a valid action shape")
+def test_targets_complete():
+    for target, table in pt.TARGETS.items():
+        for name, _label in pt.COMMANDS.values():
+            assert name in table, f"{target} missing command {name}"
+            kind, a, b = table[name]
+            assert kind in ("K", "C"), f"{target}/{name} bad kind {kind!r}"
+            assert 0 <= a <= 0xFF and 0 <= b <= 0xFF, f"{target}/{name} byte range"
+
+
+@case("leader key is not something resolve_char would also map")
+def test_leader_unambiguous():
+    # If Ctrl-] resolved as a character too, the leader would eat a real keystroke.
+    assert pt.resolve_char(pt.LEADER) is None
+
+
+def main():
+    failed = 0
+    for name, fn in CASES:
+        try:
+            fn()
+        except AssertionError as e:
+            failed += 1
+            print(f"FAIL  {name}\n        {e}")
+        except Exception as e:  # noqa: BLE001 - report any error as a failure
+            failed += 1
+            print(f"ERROR {name}\n        {type(e).__name__}: {e}")
+        else:
+            print(f"ok    {name}")
+    print(f"\n{len(CASES) - failed}/{len(CASES)} passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
