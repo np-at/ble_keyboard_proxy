@@ -44,7 +44,14 @@ mkdir -p spike/slot_switch
 
 - [ ] **Step 2: Write the spike sketch**
 
-Temporarily point `platformio.ini`'s build at the spike by adding `build_src_dir = spike/slot_switch` under `[env:esp32-s3-devkitc-1]`. Revert this in Step 8.
+Point the build at the spike by adding this to `[env:esp32-s3-devkitc-1]` in `platformio.ini`. Revert it in Step 8.
+
+```ini
+; TEMPORARY — spike only. Swaps the real firmware out for the spike sketch.
+build_src_filter = +<*> -<main.cpp> +<../spike/slot_switch/slot_switch.ino.cpp>
+```
+
+There is no `build_src_dir` option in PlatformIO — `build_src_filter` is the real one. Excluding `main.cpp` matters: leaving it in gives duplicate `setup()`/`loop()` symbols at link time.
 
 ```cpp
 // Throwaway. Answers three questions and is then deleted:
@@ -83,13 +90,19 @@ void startSlot(uint8_t slot) {
   rnd.type = BLE_ADDR_RANDOM;
   for (int i = 0; i < 6; i++) rnd.val[i] = addr[5 - i];
 
-  // ORDERING IS THE OPEN QUESTION. ble_hs_id_set_rnd needs the host stack
-  // running, so init() first, then set the address, then begin(). If the
-  // address does not take effect, try setting it before init() and record
-  // which order actually worked.
+  // Set the address after init(), not before: init() ends with
+  // `while(!m_synced) taskYIELD();`, so it does not return until the controller
+  // has synced and ble_hs_id_set_rnd can succeed. Checked in NimBLEDevice.cpp.
   NimBLEDevice::init("Proxy Keyboard");
   const int rc = ble_hs_id_set_rnd(rnd.val);
   Serial.printf("[spike] ble_hs_id_set_rnd rc=%d\n", rc);
+
+  // THE OPEN QUESTION IS THIS CALL, not the ordering above. With
+  // BLE_HOST_BASED_PRIVACY enabled, setOwnAddrType(BLE_OWN_ADDR_RANDOM) also
+  // calls ble_hs_pvcy_rpa_config(NIMBLE_HOST_ENABLE_RPA) — which makes the
+  // device advertise a *resolvable private address* rather than the static one
+  // just programmed. That would defeat per-slot identity entirely, and rc == 0
+  // would not reveal it. Step 4a checks the address actually on air.
   NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
 
   kb = new BleKeyboard("Proxy Keyboard", "ble_keyboard_proxy", 100);
@@ -158,6 +171,14 @@ void loop() {
 pio run -t upload
 ```
 Expected: build succeeds, upload completes over the CH343 UART port.
+
+- [ ] **Step 4a: Confirm the advertised address is the one we programmed**
+
+Before testing bonds, check what is actually on air. Use a BLE scanner app (nRF Connect, LightBlue) and look at the address "Proxy Keyboard" advertises.
+
+Expected: it matches the address the spike logs for the active slot, and it *changes* when you send `1`. If instead it looks random and differs on every scan, RPA privacy is on and per-slot identity cannot work as written — try `setOwnAddrType(BLE_OWN_ADDR_RANDOM, /*useNRPA=*/false)` with privacy disabled, or drop the `setOwnAddrType` call entirely and see whether the programmed static address is used on its own. Record what worked.
+
+Getting this wrong is silent: bonding would still succeed and hosts would still reconnect, but slot isolation would be an illusion. Do not skip to Step 4 without checking.
 
 - [ ] **Step 4: Run the switch sequence with two hosts**
 
@@ -621,11 +642,19 @@ class SlotStore {
   uint8_t activeSlot() const { return active_; }
   void setActiveSlot(uint8_t slot);
 
-  // Writes slot's peer identity address into `out` (6 bytes, MSB first).
-  // Returns false when the slot has no bond, leaving `out` untouched.
-  bool peerFor(uint8_t slot, uint8_t out[6]) const;
+  // Writes slot's peer identity address into `out` (6 bytes, MSB first) and its
+  // NimBLE address type into `outType`. Returns false when the slot has no bond,
+  // leaving both untouched.
+  //
+  // The type is stored, not assumed. iOS identity addresses are random-static,
+  // but some Android devices use a public identity address, and reconstructing
+  // one with the wrong type means deleteBond() silently matches nothing — the
+  // slot would report itself forgotten while the bond survived.
+  bool peerFor(uint8_t slot, uint8_t out[6], uint8_t &outType) const;
 
-  void setPeer(uint8_t slot, const uint8_t addr[6]);
+  // Returns true when this differs from what was already stored, so the caller
+  // can skip a redundant NVS write on every reconnect.
+  bool setPeer(uint8_t slot, const uint8_t addr[6], uint8_t type);
   void clearPeer(uint8_t slot);
 
   bool isBonded(uint8_t slot) const;
@@ -634,6 +663,7 @@ class SlotStore {
   Preferences prefs_;
   uint8_t active_ = 0;
   uint8_t peers_[kSlotCount][6] = {};
+  uint8_t peerTypes_[kSlotCount] = {};
   bool bonded_[kSlotCount] = {};
 };
 ```
@@ -654,6 +684,10 @@ constexpr char kActiveKey[] = "active";
 // "peer0".."peer3". Caller supplies the buffer; Preferences keys are short-lived.
 void peerKey(uint8_t slot, char out[8]) { snprintf(out, 8, "peer%u", slot); }
 
+// The address type rides along in a seventh byte rather than a second key —
+// one blob, one write, and the two can never disagree.
+constexpr size_t kPeerBlobSize = 7;
+
 }  // namespace
 
 void SlotStore::begin() {
@@ -665,7 +699,13 @@ void SlotStore::begin() {
   for (uint8_t s = 0; s < kSlotCount; s++) {
     char key[8];
     peerKey(s, key);
-    bonded_[s] = prefs_.getBytes(key, peers_[s], 6) == 6;
+
+    uint8_t blob[kPeerBlobSize];
+    if (prefs_.getBytes(key, blob, kPeerBlobSize) == kPeerBlobSize) {
+      memcpy(peers_[s], blob, 6);
+      peerTypes_[s] = blob[6];
+      bonded_[s] = true;
+    }
   }
 }
 
@@ -675,25 +715,40 @@ void SlotStore::setActiveSlot(uint8_t slot) {
   prefs_.putUChar(kActiveKey, slot);
 }
 
-bool SlotStore::peerFor(uint8_t slot, uint8_t out[6]) const {
+bool SlotStore::peerFor(uint8_t slot, uint8_t out[6], uint8_t &outType) const {
   if (slot >= kSlotCount || !bonded_[slot]) return false;
   memcpy(out, peers_[slot], 6);
+  outType = peerTypes_[slot];
   return true;
 }
 
-void SlotStore::setPeer(uint8_t slot, const uint8_t addr[6]) {
-  if (slot >= kSlotCount) return;
+bool SlotStore::setPeer(uint8_t slot, const uint8_t addr[6], uint8_t type) {
+  if (slot >= kSlotCount) return false;
+
+  // Authentication completes on every reconnect, not just the first bond.
+  // Rewriting an unchanged value would burn flash for nothing.
+  if (bonded_[slot] && peerTypes_[slot] == type && memcmp(peers_[slot], addr, 6) == 0) {
+    return false;
+  }
+
   memcpy(peers_[slot], addr, 6);
+  peerTypes_[slot] = type;
   bonded_[slot] = true;
+
+  uint8_t blob[kPeerBlobSize];
+  memcpy(blob, addr, 6);
+  blob[6] = type;
 
   char key[8];
   peerKey(slot, key);
-  prefs_.putBytes(key, addr, 6);
+  prefs_.putBytes(key, blob, kPeerBlobSize);
+  return true;
 }
 
 void SlotStore::clearPeer(uint8_t slot) {
   if (slot >= kSlotCount) return;
   memset(peers_[slot], 0, 6);
+  peerTypes_[slot] = 0;
   bonded_[slot] = false;
 
   char key[8];
@@ -815,6 +870,9 @@ class BleHidSink {
   void startSlot(uint8_t slot);
   void stopStack();
 
+  // Deletes the slot's NimBLE bond and clears it from the store.
+  void dropBond(uint8_t slot);
+
   const char *deviceName_;
   const char *manufacturer_;
   SlotKeyboard *kb_ = nullptr;
@@ -838,7 +896,11 @@ void SlotKeyboard::onAuthenticationComplete(ble_gap_conn_desc *desc) {
   // addresses MSB-first, matching how they are printed and derived.
   uint8_t addr[6];
   for (int i = 0; i < 6; i++) addr[i] = desc->peer_id_addr.val[5 - i];
-  store_->setPeer(slot_, addr);
+
+  // The type comes from the peer, never assumed: iOS uses random-static identity
+  // addresses but some Android devices use public ones, and forgetting a bond
+  // with the wrong type matches nothing and fails silently.
+  store_->setPeer(slot_, addr, desc->peer_id_addr.type);
 }
 
 BleHidSink::BleHidSink(const char *deviceName, const char *manufacturer)
@@ -885,6 +947,17 @@ void BleHidSink::stopStack() {
   wasConnected_ = false;
 }
 
+void BleHidSink::dropBond(uint8_t slot) {
+  uint8_t peer[6];
+  uint8_t type;
+  if (store_.peerFor(slot, peer, type)) {
+    uint8_t rev[6];
+    for (int i = 0; i < 6; i++) rev[i] = peer[5 - i];
+    NimBLEDevice::deleteBond(NimBLEAddress(rev, type));
+  }
+  store_.clearPeer(slot);
+}
+
 bool BleHidSink::selectSlot(uint8_t slot) {
   if (slot >= kSlotCount) return false;
   stopStack();
@@ -898,13 +971,7 @@ bool BleHidSink::pairSlot(uint8_t slot) {
 
   // Drop the old bond first so the slot advertises openly rather than waiting
   // for a device that may never come back.
-  uint8_t peer[6];
-  if (store_.peerFor(slot, peer)) {
-    uint8_t rev[6];
-    for (int i = 0; i < 6; i++) rev[i] = peer[5 - i];
-    NimBLEDevice::deleteBond(NimBLEAddress(rev, BLE_ADDR_RANDOM));
-  }
-  store_.clearPeer(slot);
+  dropBond(slot);
 
   return selectSlot(slot);
 }
@@ -912,13 +979,7 @@ bool BleHidSink::pairSlot(uint8_t slot) {
 bool BleHidSink::forgetSlot(uint8_t slot) {
   if (slot >= kSlotCount) return false;
 
-  uint8_t peer[6];
-  if (store_.peerFor(slot, peer)) {
-    uint8_t rev[6];
-    for (int i = 0; i < 6; i++) rev[i] = peer[5 - i];
-    NimBLEDevice::deleteBond(NimBLEAddress(rev, BLE_ADDR_RANDOM));
-  }
-  store_.clearPeer(slot);
+  dropBond(slot);
 
   // Restarting only matters when the forgotten slot is the one on air.
   if (slot == store_.activeSlot()) return selectSlot(slot);
@@ -1362,6 +1423,18 @@ Close the monitor first. With two devices bonded from Task 5:
 3. Press `Ctrl-]` then `h`. **Confirm the Home behaviour matches that device's keymap**, not the previous one.
 4. Press `Ctrl-]` then `1`, wait, and type. **Confirm text lands on the slot-0 device.**
 5. Press `Ctrl-]` then `q` and confirm the terminal is restored.
+
+- [ ] **Step 7a: Smoke-test the non-interactive entry points**
+
+This task rewrote `--target` resolution, which `--text` and `--probe` also pass through. They have no test coverage and would regress silently.
+
+```bash
+~/.platformio/penv/bin/python host/proxy_term.py --text 'hello'
+~/.platformio/penv/bin/python host/proxy_term.py --probe C:80:00
+~/.platformio/penv/bin/python host/proxy_term.py --target iphone --text 'hi'
+```
+
+Expected: each exits cleanly. **Confirm on the device** that `hello` was typed, that `C:80:00` triggered Home, and that the explicit `--target` was honoured rather than being overridden by the active slot's mapping.
 
 - [ ] **Step 8: Commit**
 
