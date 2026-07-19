@@ -1,0 +1,16 @@
+.pio/
+
+# PlatformIO regenerates these and they hardcode absolute local paths.
+# extensions.json is machine-independent, so it stays tracked.
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/.browse.c_cpp.db*
+.vscode/ipch/
+
+# Session scratch: a resume note plus a snapshot of the then-untracked tree.
+# Superseded by real history now that commits exist.
+CHECKPOINT.md
+CHECKPOINT.diff
+
+__pycache__/
+*.pyc
