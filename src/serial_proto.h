@@ -9,6 +9,13 @@
 //   C <b0> <b1>                             consumer/media bitmask
 //   R                                       release all
 //   P                                       ping -> "OK <state>"
+//   S <slot>   select the active bond slot     -> OK slot 2 bonded advertising
+//   B <slot>   clear the slot and pair anew    -> OK pairing 2
+//   U <slot>   forget the slot's bond          -> OK cleared 2
+//
+// These reply OK rather than SENT: unlike a HID report, a slot change is a local
+// action the firmware genuinely knows it performed. OK still says nothing about
+// whether the host reconnected — only the device can show that.
 //
 // Example, a capital A:
 //   K 02 04 00 00 00 00 00

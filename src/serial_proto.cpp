@@ -2,6 +2,8 @@
 
 #include <ctype.h>
 
+#include "slot_address.h"
+
 namespace {
 
 // Returns -1 if not a hex digit.
@@ -39,6 +41,22 @@ bool nextHexByte(const char *s, size_t len, size_t &pos, uint8_t &out) {
 bool atEnd(const char *s, size_t len, size_t pos) {
   while (pos < len && isspace((unsigned char)s[pos])) pos++;
   return pos >= len;
+}
+
+// Parses the single slot argument shared by S, B and U. Slots are a small
+// decimal index, not a hex byte — they are not a wire value like a usage code,
+// and "S 10" should be rejected rather than read as sixteen.
+bool parseSlot(const char *s, size_t len, size_t &pos, uint8_t &out) {
+  while (pos < len && isspace((unsigned char)s[pos])) pos++;
+  if (pos >= len) return false;
+  const char c = s[pos];
+  if (c < '0' || c > '9') return false;
+  pos++;
+  const uint8_t slot = (uint8_t)(c - '0');
+  if (slot >= kSlotCount) return false;
+  if (pos < len && !isspace((unsigned char)s[pos])) return false;
+  out = slot;
+  return true;
 }
 
 }  // namespace
@@ -128,9 +146,30 @@ Command SerialProto::parseLine() {
       if (cmd.kind == CommandKind::Error) cmd.error = "P takes no arguments";
       return cmd;
 
+    case 'S':
+    case 'B':
+    case 'U': {
+      uint8_t slot;
+      if (!parseSlot(line_, len_, pos, slot)) {
+        cmd.kind = CommandKind::Error;
+        cmd.error = "slot must be a single digit 0-3";
+        return cmd;
+      }
+      if (!atEnd(line_, len_, pos)) {
+        cmd.kind = CommandKind::Error;
+        cmd.error = "slot command takes one argument";
+        return cmd;
+      }
+      cmd.slot = slot;
+      cmd.kind = (verb == 'S')   ? CommandKind::SelectSlot
+                 : (verb == 'B') ? CommandKind::PairSlot
+                                 : CommandKind::ForgetSlot;
+      return cmd;
+    }
+
     default:
       cmd.kind = CommandKind::Error;
-      cmd.error = "unknown command (expected K, C, R or P)";
+      cmd.error = "unknown command (expected K, C, R, P, S, B or U)";
       return cmd;
   }
 }

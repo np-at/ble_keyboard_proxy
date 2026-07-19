@@ -36,12 +36,16 @@ enum class CommandKind {
   Consumer,  // media bitmask in `consumer`
   ReleaseAll,
   Ping,
-  Error,  // malformed line; `error` holds a short reason
+  SelectSlot,  // make `slot` the active bond slot
+  PairSlot,    // clear `slot`'s bond and advertise openly to pair
+  ForgetSlot,  // drop `slot`'s bond
+  Error,       // malformed line; `error` holds a short reason
 };
 
 struct Command {
   CommandKind kind = CommandKind::None;
   HidReport key;
   ConsumerReport consumer;
+  uint8_t slot = 0;  // for SelectSlot / PairSlot / ForgetSlot
   const char *error = nullptr;
 };
