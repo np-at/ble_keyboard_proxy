@@ -6,7 +6,8 @@ silent, because the firmware answering SENT tells you nothing about whether the
 right usage code was chosen. Anything involving the serial link or a real terminal
 is out of scope here and has to be exercised by hand.
 
-    ~/.platformio/penv/bin/python host/test_proxy_term.py
+    ~/.platformio/penv/bin/python host/test_proxy_term.py           # all
+    ~/.platformio/penv/bin/python host/test_proxy_term.py escape    # matching only
 """
 
 import sys
@@ -136,8 +137,15 @@ def test_leader_unambiguous():
 
 
 def main():
+    # Optional substring filter: `test_proxy_term.py escape` runs matching cases only.
+    pattern = sys.argv[1] if len(sys.argv) > 1 else ""
+    cases = [(n, f) for n, f in CASES if pattern.lower() in n.lower()]
+    if not cases:
+        print(f"no test matches {pattern!r}")
+        return 1
+
     failed = 0
-    for name, fn in CASES:
+    for name, fn in cases:
         try:
             fn()
         except AssertionError as e:
@@ -148,7 +156,7 @@ def main():
             print(f"ERROR {name}\n        {type(e).__name__}: {e}")
         else:
             print(f"ok    {name}")
-    print(f"\n{len(CASES) - failed}/{len(CASES)} passed")
+    print(f"\n{len(cases) - failed}/{len(cases)} passed")
     return 1 if failed else 0
 
 
