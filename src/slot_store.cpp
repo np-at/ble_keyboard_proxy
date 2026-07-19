@@ -1,6 +1,7 @@
 // src/slot_store.cpp
 #include "slot_store.h"
 
+#include <stdio.h>
 #include <string.h>
 
 namespace {
