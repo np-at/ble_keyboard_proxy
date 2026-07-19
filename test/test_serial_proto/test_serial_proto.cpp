@@ -43,6 +43,13 @@ void test_trailing_junk_is_an_error(void) {
   TEST_ASSERT_TRUE(parse("S 1 1").kind == CommandKind::Error);
 }
 
+void test_multi_digit_slot_is_an_error(void) {
+  // Pins the rejection inside parseSlot: multi-digit slot "S 10" must fail
+  // at the isspace check after the single digit, not be silently truncated.
+  // The atEnd check would otherwise mask this failure.
+  TEST_ASSERT_TRUE(parse("S 10").kind == CommandKind::Error);
+}
+
 void test_lowercase_verb_works(void) {
   // The existing verbs are case-insensitive; these must not be an exception.
   TEST_ASSERT_TRUE(parse("s 1").kind == CommandKind::SelectSlot);
@@ -66,6 +73,7 @@ int main(int, char **) {
   RUN_TEST(test_slot_out_of_range_is_an_error);
   RUN_TEST(test_missing_slot_is_an_error);
   RUN_TEST(test_trailing_junk_is_an_error);
+  RUN_TEST(test_multi_digit_slot_is_an_error);
   RUN_TEST(test_lowercase_verb_works);
   RUN_TEST(test_existing_verbs_still_parse);
   return UNITY_END();
