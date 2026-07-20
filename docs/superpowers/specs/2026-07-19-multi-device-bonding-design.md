@@ -114,10 +114,37 @@ loop() -> switchTo -> deinit(true) -> NimBLEServer::~NimBLEServer()
 file scope — so `kb_` is in `.bss`, never `malloc`'d. This is inert today only
 because the firmware never calls `deinit()`. The moment slot switching
 introduces `deinit(true)`, `~NimBLEServer` will call `delete` on a static
-address. Fix: after `kb_.begin()`, re-register with
-`NimBLEDevice::getServer()->setCallbacks(&kb_, false)` to clear the ownership
-flag — this keeps the by-value member and the sink's current API. (Alternative:
-make `kb_` a heap pointer and let NimBLE own it, as the spike does.)
+address.
+
+Two ways out, and Task 5 must pick one deliberately:
+
+1. **Heap pointer — the model the spike actually validated.** Make `kb_` a
+   `BleKeyboard *`, `new` it per switch, and let NimBLE free it in
+   `~NimBLEServer`. Proven on hardware across a full switch test. Changes the
+   sink's shape.
+2. **Keep it by value and disown it.** After `kb_.begin()`, re-register with
+   `NimBLEDevice::getServer()->setCallbacks(&kb_, false)` to clear
+   `m_deleteCallbacks`. Keeps the current API. **Untested — this is a proposal,
+   not a spike result.**
+
+Note what does *not* separate them: the leak. `BleKeyboard` declares **no
+destructor** (the one in the backtrace is implicit) and the library contains no
+`delete` at all, so the `BLEHIDDevice` that `begin()` allocates is never freed
+under either option. Option 1 does not reclaim it by "running the destructor" —
+there is nothing in the destructor to run. The services themselves are freed by
+`~NimBLEServer` via `m_svcVec`; what leaks is the `BLEHIDDevice` wrapper, in
+both cases. **This is why the unmeasured heap delta matters** — it decides
+whether either option is viable long-term, or whether the library needs
+vendoring.
+
+Also settled: `BleKeyboard` registers itself as *two* callbacks — server
+(`BleKeyboard.cpp:108`) and characteristic (line 115). Only the server path
+deletes; `~NimBLEServer` destroys characteristics before deleting the server
+callback, so if the characteristic also owned it the fixed spike would have
+double-freed on the first switch. It did not, across the whole test. Clearing
+the server-side flag is therefore sufficient. This also retroactively explains
+the `InstrFetchProhibited` (PC=0) crashes: fallout from the already-corrupted
+heap, which disappeared after a full `pio run -t erase`.
 
 **Not established by this spike — do not treat as proven:**
 
