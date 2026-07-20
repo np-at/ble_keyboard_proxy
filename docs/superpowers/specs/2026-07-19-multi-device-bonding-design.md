@@ -72,6 +72,65 @@ in STATUS.md. Do not push on with a mechanism the hardware rejected.
 Verification requires two BLE hosts. One device cannot test this feature — a
 single host that reconnects proves nothing about slot isolation.
 
+## Spike results — PASSED (2026-07-19)
+
+Run on real hardware by the user, two phones, from branch `spike/slot-switch`
+(`src/slot_switch_spike.cpp`). All four switch steps above passed: both hosts
+bonded, and switching in both directions typed on the right device **with no
+re-pairing prompt**. The per-slot identity architecture is confirmed; the
+whitelist fallback is not needed.
+
+**The mechanics, now settled:**
+
+- `ble_hs_id_set_rnd` is called **after** `NimBLEDevice::init()` and returns
+  `rc=0`. The ordering works because `init()` ends with
+  `while (!m_synced) taskYIELD();`, so it does not return until the controller
+  has synced. Do not "fix" this ordering.
+- The include is `nimble/nimble/host/include/host/ble_hs_id.h`, guarded on
+  `CONFIG_NIMBLE_CPP_IDF`. `<host/ble_hs.h>` does not exist in this build.
+- `NimBLEDevice::deinit(true)` **preserves bonds** across the switch and across
+  a reboot. No need to fall back to `deinit(false)`.
+- `setOwnAddrType(BLE_OWN_ADDR_RANDOM)` stayed in and the switch worked.
+
+**The bug the spike actually caught — this is the load-bearing finding for Task 5.**
+
+The first spike build panicked with `CORRUPT HEAP` inside `~NimBLEServer`, and
+separately with `InstrFetchProhibited` (PC=0) on the GAP disconnect path.
+Symbolized against the flashed ELF, the cause was a **double free**:
+
+```
+loop() -> switchTo -> deinit(true) -> NimBLEServer::~NimBLEServer()
+  -> non-virtual thunk to BleKeyboard::~BleKeyboard() -> operator delete
+```
+
+`BleKeyboard` derives from `BLEServerCallbacks` and registers itself with
+`pServer->setCallbacks(this)` (`BleKeyboard.cpp:108`).
+`NimBLEServer::setCallbacks` defaults `m_deleteCallbacks = true`
+(`NimBLEServer.cpp:49`), so `~NimBLEServer` runs `delete m_pServerCallbacks`.
+**NimBLE owns the `BleKeyboard` object.** The spike deleted it as well.
+
+**Task 5 must handle this, and its version is worse.** `BleHidSink` holds
+`BleKeyboard kb_` *by value*, and `main.cpp` instantiates `BleHidSink sink` at
+file scope — so `kb_` is in `.bss`, never `malloc`'d. This is inert today only
+because the firmware never calls `deinit()`. The moment slot switching
+introduces `deinit(true)`, `~NimBLEServer` will call `delete` on a static
+address. Fix: after `kb_.begin()`, re-register with
+`NimBLEDevice::getServer()->setCallbacks(&kb_, false)` to clear the ownership
+flag — this keeps the by-value member and the sink's current API. (Alternative:
+make `kb_` a heap pointer and let NimBLE own it, as the spike does.)
+
+**Not established by this spike — do not treat as proven:**
+
+- **Heap delta per switch cycle was not recorded.** The leak risk in the
+  section above is therefore still open. Measure it during Task 5.
+- **The Step 4a scanner check was not recorded.** Whether the address on air
+  actually equals the programmed static address, and is stable across scans, is
+  unconfirmed. Switching worked, which is strong indirect evidence that RPA is
+  not overriding the static address — but it is inference, not observation.
+- **Only 2 slots were exercised.** Branch `spike/slot-switch` predates Task 2
+  and lacks `-DCONFIG_BT_NIMBLE_MAX_BONDS=4`; NimBLE's default is 3. That 4
+  slots work needs its own check once Task 5 lands.
+
 ## Identity addresses
 
 Derived from the chip's efuse base MAC:
