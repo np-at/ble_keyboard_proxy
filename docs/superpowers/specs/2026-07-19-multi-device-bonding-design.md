@@ -133,9 +133,40 @@ destructor** (the one in the backtrace is implicit) and the library contains no
 under either option. Option 1 does not reclaim it by "running the destructor" —
 there is nothing in the destructor to run. The services themselves are freed by
 `~NimBLEServer` via `m_svcVec`; what leaks is the `BLEHIDDevice` wrapper, in
-both cases. **This is why the unmeasured heap delta matters** — it decides
-whether either option is viable long-term, or whether the library needs
-vendoring.
+both cases. The measured leak is a constant 60 bytes per switch (see the
+results below), which both options carry equally and which is small enough to
+ship.
+
+### Option 3: hot address swap — no teardown at all (UNSPIKED)
+
+Both options above assume the switch requires `deinit(true)`. It does not.
+`ble_hs_id_set_rnd` (`ble_hs_id.c:152`) has no dependency on init/deinit state:
+it validates the address bits, sends HCI `LE_Set_Random_Address`, and `memcpy`s
+into `ble_hs_id_rnd`. Nothing more. So the switch can be:
+
+```
+disconnect active peers
+NimBLEDevice::stopAdvertising()
+ble_hs_id_set_rnd(newSlotAddr)
+NimBLEDevice::startAdvertising()
+```
+
+The stack, GATT server, `BLEHIDDevice` and `BleKeyboard` all stay alive.
+Nothing is destroyed or reallocated, which means **the 60-byte leak goes to
+zero** (there is no second `begin()` to allocate it) and **the ownership hazard
+becomes unreachable** (no `~NimBLEServer`, so nothing ever deletes the callbacks
+object — `kb_` can stay by value). Switching is also faster and GATT handles
+stay stable.
+
+**Not verified on hardware. Two real unknowns:** the Bluetooth spec has the
+controller reject `LE_Set_Random_Address` with *Command Disallowed* while
+advertising/scanning/initiating is enabled — hence stopping advertising first,
+but whether the ESP32-S3 controller accepts it with a live GATT server is
+empirical, and `rc` will say. Second, whether bonded hosts still reconnect
+after a hot swap: the mechanism depends on the peer's stored LTK surviving a
+change of *our* identity. Spike it as an extra command alongside `0`-`3` so
+both paths can be A/B'd in one build; the `deinit` path is validated and stays
+the fallback.
 
 Also settled: `BleKeyboard` registers itself as *two* callbacks — server
 (`BleKeyboard.cpp:108`) and characteristic (line 115). Only the server path
@@ -148,20 +179,23 @@ heap, which disappeared after a full `pio run -t erase`.
 
 **Not established by this spike — do not treat as proven:**
 
-- **Heap leaks per switch cycle, and the trend is not yet characterised.**
-  Three measured cycles: `-20`, `-48`, `-60` bytes (285112 → 284984, ~43
-  avg). It leaks — that much is settled, and it matches the `BLEHIDDevice`
-  that `begin()` allocates and nothing frees. What is NOT settled is whether
-  the per-cycle cost is converging on a constant (~60 b/cycle → roughly 4700
-  switches of runway, survivable) or climbing because the leaked wrapper is
-  fragmenting the pool (fatal much sooner than the byte count suggests, and
-  invisible to `getFreeHeap()`). Three samples cannot separate these.
-  Resolve before Task 5 commits to a teardown model: run ten cycles and see
-  whether the deltas flatten; if ambiguous, log `ESP.getMaxAllocHeap()`
-  alongside `getFreeHeap()` — free heap sinking slowly while max-alloc sinks
-  fast is the fragmentation signature. If it is fragmentation, neither
-  ownership option in the section above saves it and the keyboard library
-  needs vendoring with a real destructor.
+- **Heap: a constant 60-byte leak per switch. Characterised over 21 switches,
+  now CLOSED.** Measure at the same point in every cycle — the `slot N up,
+  heap=` line. The `heap before/after ... delta=` figures the spike prints are
+  **noise**: those two samples straddle transient connection and advertising
+  allocations, and they ranged `-4` to `-72` while the real per-cycle cost never
+  moved. At the stable sampling point: `-60` on 20 of 21 switches, one `-68`;
+  first-half mean `-60.8`, second-half mean `-60.0`; 1268 bytes over 21
+  switches.
+
+  **No acceleration, so this is not fragmentation** — it is a fixed allocation
+  never freed, matching the `BLEHIDDevice` that `begin()` news on each rebuild.
+  Therefore `ESP.getMaxAllocHeap()` instrumentation is unnecessary and the
+  keyboard library does **not** need vendoring.
+
+  Runway: ~4700 switches to bare exhaustion, realistically ~800–1600 before
+  BLE-stack headroom gets tight. RAM-only — a reboot resets it fully. Shippable
+  as-is; document it in `STATUS.md` during Task 8.
 - **Step 4a passed** (observed, not inferred): the address seen on air matched
   the logged `target address` and was stable across runs. So RPA privacy is NOT
   overriding the programmed static address, and
