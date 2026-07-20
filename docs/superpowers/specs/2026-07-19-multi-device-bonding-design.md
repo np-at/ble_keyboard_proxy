@@ -148,12 +148,27 @@ heap, which disappeared after a full `pio run -t erase`.
 
 **Not established by this spike — do not treat as proven:**
 
-- **Heap delta per switch cycle was not recorded.** The leak risk in the
-  section above is therefore still open. Measure it during Task 5.
-- **The Step 4a scanner check was not recorded.** Whether the address on air
-  actually equals the programmed static address, and is stable across scans, is
-  unconfirmed. Switching worked, which is strong indirect evidence that RPA is
-  not overriding the static address — but it is inference, not observation.
+- **Heap leaks per switch cycle, and the trend is not yet characterised.**
+  Three measured cycles: `-20`, `-48`, `-60` bytes (285112 → 284984, ~43
+  avg). It leaks — that much is settled, and it matches the `BLEHIDDevice`
+  that `begin()` allocates and nothing frees. What is NOT settled is whether
+  the per-cycle cost is converging on a constant (~60 b/cycle → roughly 4700
+  switches of runway, survivable) or climbing because the leaked wrapper is
+  fragmenting the pool (fatal much sooner than the byte count suggests, and
+  invisible to `getFreeHeap()`). Three samples cannot separate these.
+  Resolve before Task 5 commits to a teardown model: run ten cycles and see
+  whether the deltas flatten; if ambiguous, log `ESP.getMaxAllocHeap()`
+  alongside `getFreeHeap()` — free heap sinking slowly while max-alloc sinks
+  fast is the fragmentation signature. If it is fragmentation, neither
+  ownership option in the section above saves it and the keyboard library
+  needs vendoring with a real destructor.
+- **Step 4a passed** (observed, not inferred): the address seen on air matched
+  the logged `target address` and was stable across runs. So RPA privacy is NOT
+  overriding the programmed static address, and
+  `setOwnAddrType(BLE_OWN_ADDR_RANDOM)` stays in Task 5 as written — the
+  fallbacks contemplated in the spike sketch's comment (dropping the call, or
+  `useNRPA=false`) are not needed. This was the silent-failure risk in the
+  design; it is closed.
 - **Only 2 slots were exercised.** Branch `spike/slot-switch` predates Task 2
   and lacks `-DCONFIG_BT_NIMBLE_MAX_BONDS=4`; NimBLE's default is 3. That 4
   slots work needs its own check once Task 5 lands.
