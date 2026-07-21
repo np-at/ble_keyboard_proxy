@@ -72,13 +72,23 @@ in STATUS.md. Do not push on with a mechanism the hardware rejected.
 Verification requires two BLE hosts. One device cannot test this feature — a
 single host that reconnects proves nothing about slot isolation.
 
-## Spike results — PASSED (2026-07-19)
+## Spike results — switch gate PASSED (2026-07-19), reconnect BLOCKED (2026-07-20)
 
 Run on real hardware by the user, two phones, from branch `spike/slot-switch`
 (`src/slot_switch_spike.cpp`). All four switch steps above passed: both hosts
 bonded, and switching in both directions typed on the right device **with no
 re-pairing prompt**. The per-slot identity architecture is confirmed; the
 whitelist fallback is not needed.
+
+> **UPDATE 2026-07-20 — a blocker was found underneath the switch gate.** A bonded
+> device **cannot reconnect into a working typing link** under the per-slot
+> static-random address setup (both the `deinit` switch *and* the Option 3 hot
+> swap fail the same way; a plain phone-side BT cycle with no server rebuild also
+> fails). The shipping `main` firmware reconnects and types fine, so this is
+> **not** product-wide — it is isolated to the spike's address config. Blocks
+> Task 5. Full analysis and the diagnostic-first next step are in **"Reconnect
+> blocker (2026-07-20)"** below. The 2026-07-19 findings in this section remain
+> accurate about the *switch mechanism*; they simply did not test bonded reconnect.
 
 **The mechanics, now settled:**
 
@@ -206,6 +216,76 @@ heap, which disappeared after a full `pio run -t erase`.
 - **Only 2 slots were exercised.** Branch `spike/slot-switch` predates Task 2
   and lacks `-DCONFIG_BT_NIMBLE_MAX_BONDS=4`; NimBLE's default is 3. That 4
   slots work needs its own check once Task 5 lands.
+
+### Reconnect blocker (2026-07-20) — BLOCKS Task 5
+
+The switch gate above tested *switching between two already-connected hosts*. It
+did **not** test a bonded host **reconnecting from cold** with the slot address
+in place. That path is broken.
+
+**Hardware results (iOS is the reliable oracle; Android HID never renders):**
+
+| Test | Result |
+|---|---|
+| Hot-swap `set_rnd` rc / address change / heap / bonds | rc=0, address changes, delta=0, bonds=2 — mechanically perfect |
+| Hot-swap: iOS reconnect | **FAIL** |
+| Deinit-switch: iOS reconnect (clean bench) | **FAIL** |
+| Full reboot: iOS reconnect | **"connects" in iOS UI but does NOT type** (hollow) |
+| Phone-side BT cycle to the *same running server* (no GATT rebuild) | **FAIL** |
+| Fresh pair (any slot), iOS: typing | **WORKS** |
+| **`main` firmware: fresh pair types, then BT-cycle reconnect types** | **BOTH WORK** |
+
+So both switch mechanisms are moot until reconnect is fixed — the bug sits
+*underneath* the switch-mechanism choice. Option 3's zero-leak advantage is
+irrelevant while reconnect is broken.
+
+**Source-grounded analysis (vendored NimBLE-Arduino 1.4.3 — the compiled code):**
+
+- **The only runtime delta between `main` (reconnects) and the spike (fails) is
+  the local address**: `ble_hs_id_set_rnd()` + `own_addr_type = RANDOM`. Verified
+  identical otherwise — `sm_our_key_dist`/`sm_their_key_dist` are both `ENC|ID`
+  for main and spike (`NimBLEDevice.cpp:895-896`; the spike's `setOwnAddrType`
+  re-sets the same value), and peer-IRK resolving-list population
+  (`ble_store.c:241`, `ble_hs_misc.c:130`) is ungated on address type.
+- **Two earlier hypotheses are refuted by source:**
+  1. *"RPA on air instead of the static address"* — ruled out. Host-based privacy
+     is compiled out on the S3 (`CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY` undefined →
+     0), so `setOwnAddrType(RANDOM)` never calls `ble_hs_pvcy_rpa_config`. The
+     scanner already confirmed the static address on air (Step 4a above).
+  2. *"The spike distributes the public identity, not the static-random slot
+     address"* — contradicted. `IDENTITY_ADDR_INFO` (`ble_sm.c:2194`) sends
+     `our_id_addr`, which for RANDOM own-addr-type is `ble_hs_id_rnd` (the address
+     just programmed); the privacy-override branch (`ble_sm.c:2181`) is compiled
+     out. Distributed identity == advertised address.
+- **The critical path:** on an iOS SC reconnect the peripheral must resolve iOS's
+  rotating RPA to the bonded identity, because the LTK store lookup keys on the
+  resolved peer identity (`ble_sm_ltk_req_rx` → `ble_sm_retrieve_ltk`,
+  `ble_sm.c:1439`; ediv/rand are 0 under SC). A failed resolution → LTK not found
+  → encryption never completes → "connects but doesn't type."
+- **Honest gap:** resolution and LTK-lookup paths read *identically* in source for
+  main and spike, so source alone cannot say whether the spike breaks at
+  resolution, LTK lookup, or CCCD restore. It is a controller-level interaction
+  with the static-random address that only on-device logs can localize.
+
+**Next step (no blind hardware cycles): a diagnostic-first flash.** The spike now
+carries `dumpConnInfo`/`pollConnState` (added 2026-07-20), which print per-peer
+`ota`/`id`/`bonded`/`enc` **on every connection state change** via the public
+`NimBLEConnInfo` API (no library patching). On a reconnect the `id`-vs-`ota`
+address pair discriminates the failing sub-step — resolution vs LTK vs CCCD — and
+that picks the fix. See the reconnect-research note for the decode table.
+
+**Multi-device landmine for the 4-slot goal (independent of the reconnect fix):**
+all ESP32 NimBLE devices ship the **same default local IRK**
+([h2zero/NimBLE-Arduino #539](https://github.com/h2zero/NimBLE-Arduino/issues/539)).
+Per-slot bonds on one chip already use *distinct* static-random addresses; give
+each slot a **distinct local IRK** too (`ble_hs_pvcy_set_our_irk`, set before
+bonds load) to remove cross-slot identity ambiguity on the phone. Worth doing
+regardless of what the diagnostic shows.
+
+**Android (separate, untriaged):** Android never types even on a fresh pair
+(soft keyboard *is* suppressed → recognized as a keyboard, but no characters
+render). An Android-only BLE-HID target-compat problem, independent of
+multi-device.
 
 ## Identity addresses
 
